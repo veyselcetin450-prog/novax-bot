@@ -1,5 +1,4 @@
 import os
-import json
 import requests
 from flask import Flask, request, jsonify
 from anthropic import Anthropic
@@ -18,6 +17,9 @@ TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID")
 
 pending_replies = {}
 pending_posts = {}
+waiting_feedback = {}  # Kullanıcıdan fikir bekleniyor mu?
+
+IMAGE_URL = "https://images.unsplash.com/photo-1509042239860-f550ce710b93?w=1080&q=80"
 
 def send_telegram(message):
     url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
@@ -43,9 +45,56 @@ def send_telegram_photo_with_buttons(image_url, caption, buttons):
         "reply_markup": keyboard,
         "parse_mode": "HTML"
     })
-    # Eğer URL ile gönderemediyse metin olarak gönder
     if not response.json().get("ok"):
         send_telegram_with_buttons(f"🖼 Görsel yüklenemedi.\n\n{caption}", buttons)
+
+def generate_post(feedback=None):
+    topics = [
+        "sabah kahvesi motivasyonu",
+        "ders arası snack önerisi",
+        "kampüs hayatı ve otomat",
+        "sınav döneminde enerji",
+        "yeni ürün tanıtımı"
+    ]
+    import random
+    topic = random.choice(topics)
+
+    user_content = f"Bugünkü konu: {topic}. Instagram postu yaz."
+    if feedback:
+        user_content += f"\n\nKullanıcı geri bildirimi: {feedback}"
+
+    response = client.messages.create(
+        model="claude-sonnet-4-20250514",
+        max_tokens=300,
+        system="""Sen ODTÜ KKK'daki NovaX otomat şirketinin sosyal medya yöneticisisin.
+Instagram için Türkçe, enerjik ve genç bir dille post yazıyorsun.
+Post metni + emoji + hashtag içermeli.
+Maksimum 150 kelime.""",
+        messages=[{"role": "user", "content": user_content}]
+    )
+    return response.content[0].text
+
+def send_post_to_telegram(caption, post_id):
+    pending_posts[post_id] = {"image_url": IMAGE_URL, "caption": caption}
+
+    telegram_caption = f"""📸 <b>Günlük Post Hazır!</b>
+
+📝 <b>İçerik:</b>
+{caption}
+
+Onaylıyor musunuz?"""
+
+    buttons = [
+        [
+            {"text": "✅ Paylaş", "callback_data": f"approve_post_{post_id}"},
+            {"text": "❌ İptal", "callback_data": f"reject_post_{post_id}"}
+        ],
+        [
+            {"text": "🔄 Yeniden Oluştur", "callback_data": f"regen_post_{post_id}"},
+            {"text": "💡 Fikir Ver", "callback_data": f"feedback_post_{post_id}"}
+        ]
+    ]
+    send_telegram_photo_with_buttons(IMAGE_URL, telegram_caption, buttons)
 
 def generate_dm_reply(user_message, username):
     response = client.messages.create(
@@ -61,28 +110,6 @@ Kısa ve net cevaplar ver.""",
     )
     return response.content[0].text
 
-def generate_post():
-    topics = [
-        "sabah kahvesi motivasyonu",
-        "ders arası snack önerisi",
-        "kampüs hayatı ve otomat",
-        "sınav döneminde enerji",
-        "yeni ürün tanıtımı"
-    ]
-    import random
-    topic = random.choice(topics)
-
-    response = client.messages.create(
-        model="claude-sonnet-4-20250514",
-        max_tokens=300,
-        system="""Sen ODTÜ KKK'daki NovaX otomat şirketinin sosyal medya yöneticisisin.
-Instagram için Türkçe, enerjik ve genç bir dille post yazıyorsun.
-Post metni + emoji + hashtag içermeli.
-Maksimum 150 kelime.""",
-        messages=[{"role": "user", "content": f"Bugünkü konu: {topic}. Instagram postu yaz."}]
-    )
-    return response.content[0].text
-
 def send_instagram_reply(recipient_id, message):
     url = f"https://graph.facebook.com/v25.0/me/messages"
     payload = {
@@ -90,26 +117,22 @@ def send_instagram_reply(recipient_id, message):
         "message": {"text": message},
         "access_token": INSTAGRAM_ACCESS_TOKEN
     }
-    response = requests.post(url, json=payload)
-    return response.json()
+    return requests.post(url, json=payload).json()
 
 def publish_instagram_post(image_url, caption):
     media_url = f"https://graph.facebook.com/v25.0/{INSTAGRAM_BUSINESS_ACCOUNT_ID}/media"
-    media_payload = {
+    media_response = requests.post(media_url, json={
         "image_url": image_url,
         "caption": caption,
         "access_token": INSTAGRAM_ACCESS_TOKEN
-    }
-    media_response = requests.post(media_url, json=media_payload).json()
+    }).json()
 
     if "id" in media_response:
         creation_id = media_response["id"]
-        publish_url = f"https://graph.facebook.com/v25.0/{INSTAGRAM_BUSINESS_ACCOUNT_ID}/media_publish"
-        publish_payload = {
-            "creation_id": creation_id,
-            "access_token": INSTAGRAM_ACCESS_TOKEN
-        }
-        return requests.post(publish_url, json=publish_payload).json()
+        return requests.post(
+            f"https://graph.facebook.com/v25.0/{INSTAGRAM_BUSINESS_ACCOUNT_ID}/media_publish",
+            json={"creation_id": creation_id, "access_token": INSTAGRAM_ACCESS_TOKEN}
+        ).json()
     return media_response
 
 @app.route("/webhook", methods=["GET"])
@@ -135,31 +158,37 @@ def handle_webhook():
                         params={"fields": "name,username", "access_token": INSTAGRAM_ACCESS_TOKEN}
                     ).json()
                     username = user_info.get("username", "kullanıcı")
-
                     reply = generate_dm_reply(message, username)
-
                     reply_id = f"reply_{sender_id}_{int(time.time())}"
                     pending_replies[reply_id] = {"sender_id": sender_id, "reply": reply}
-
-                    telegram_msg = f"""📩 <b>Yeni Instagram DM!</b>
-👤 @{username}
-💬 Mesaj: {message}
-
-🤖 AI Cevabı:
-{reply}
-
-Onaylıyor musunuz?"""
 
                     buttons = [[
                         {"text": "✅ Onayla", "callback_data": f"approve_{reply_id}"},
                         {"text": "❌ Reddet", "callback_data": f"reject_{reply_id}"}
                     ]]
-                    send_telegram_with_buttons(telegram_msg, buttons)
+                    send_telegram_with_buttons(
+                        f"📩 <b>Yeni Instagram DM!</b>\n👤 @{username}\n💬 {message}\n\n🤖 AI Cevabı:\n{reply}\n\nOnaylıyor musunuz?",
+                        buttons
+                    )
     return jsonify({"status": "ok"})
 
 @app.route("/telegram-webhook", methods=["POST"])
 def telegram_webhook():
     data = request.json
+
+    # Kullanıcı feedback mesajı bekliyorsa
+    message = data.get("message")
+    if message:
+        chat_id = str(message.get("chat", {}).get("id", ""))
+        text = message.get("text", "")
+        if chat_id == str(TELEGRAM_CHAT_ID) and chat_id in waiting_feedback:
+            post_id = waiting_feedback.pop(chat_id)
+            send_telegram("⏳ Fikrinizle yeni post oluşturuluyor...")
+            new_caption = generate_post(feedback=text)
+            new_post_id = f"post_{int(time.time())}"
+            send_post_to_telegram(new_caption, new_post_id)
+            return jsonify({"status": "ok"})
+
     callback = data.get("callback_query")
     if callback:
         callback_data = callback.get("data", "")
@@ -191,36 +220,31 @@ def telegram_webhook():
             pending_posts.pop(post_id, None)
             send_telegram("❌ Post iptal edildi.")
 
+        elif callback_data.startswith("regen_post_"):
+            send_telegram("⏳ Yeni post oluşturuluyor...")
+            new_caption = generate_post()
+            new_post_id = f"post_{int(time.time())}"
+            send_post_to_telegram(new_caption, new_post_id)
+
+        elif callback_data.startswith("feedback_post_"):
+            chat_id = str(callback.get("message", {}).get("chat", {}).get("id", ""))
+            waiting_feedback[chat_id] = f"post_{int(time.time())}"
+            send_telegram("💡 Fikrinizi yazın (örn: 'daha kısa olsun', 'kahve temalı yap', 'daha eğlenceli olsun'):")
+
     return jsonify({"status": "ok"})
 
 @app.route("/generate-post", methods=["GET"])
 def trigger_post():
     caption = generate_post()
     post_id = f"post_{int(time.time())}"
-
-    # Varsayılan görsel - kahve temalı
-    image_url = "https://images.unsplash.com/photo-1509042239860-f550ce710b93?w=1080&q=80"
-    pending_posts[post_id] = {"image_url": image_url, "caption": caption}
-
-    telegram_caption = f"""📸 <b>Günlük Post Hazır!</b>
-
-📝 <b>İçerik:</b>
-{caption}
-
-Paylaşılsın mı?"""
-
-    buttons = [[
-        {"text": "✅ Paylaş", "callback_data": f"approve_post_{post_id}"},
-        {"text": "❌ İptal", "callback_data": f"reject_post_{post_id}"}
-    ]]
-
-    send_telegram_photo_with_buttons(image_url, telegram_caption, buttons)
+    send_post_to_telegram(caption, post_id)
     return jsonify({"status": "Post onay için Telegram'a gönderildi"})
 
 def daily_post_job():
     try:
-        with app.test_request_context():
-            trigger_post()
+        caption = generate_post()
+        post_id = f"post_{int(time.time())}"
+        send_post_to_telegram(caption, post_id)
     except Exception as e:
         send_telegram(f"❌ Post oluşturma hatası: {str(e)}")
 
